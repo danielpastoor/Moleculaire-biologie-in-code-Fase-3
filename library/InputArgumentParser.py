@@ -1,4 +1,3 @@
-from enum import Enum
 from sys import argv
 from typing import Callable, Self, Union
 
@@ -16,17 +15,23 @@ class InputArgumentInvalid(Exception):
 class ArgumentInfo:
     # devines argument type
     argument_name: str
-    validating_functions = list[Callable[[str, str, Self], bool]]()
+    validating_functions: list[Callable[[str, Self], bool]]
     value = ""
     required = True
     description = ""
+
+    def __init__(self) -> None:
+        self.validating_functions = list[Callable[[str, Self], bool]]()
+        self.required = True
+        self.value = ""
+        self.description = ""
 
     def set_name(self, argument_name: str) -> Self:
         self.argument_name = argument_name
 
         return self
 
-    def add_custom_validation(self, function: Callable[[str, str, Self], bool]) -> Self:
+    def add_custom_validation(self, function: Callable[[str, Self], bool]) -> Self:
         self.validating_functions.append(function)
         return self
 
@@ -42,7 +47,7 @@ class ArgumentInfo:
         return self
 
     def is_required(self) -> Self:
-        if len(self.value) > 0:
+        if self.value:
             raise Exception(
                 "You were trying to set the required true but you already have defined a default")
 
@@ -74,7 +79,7 @@ class InputArgumentParser:
     # endregion
 
     # region get
-    def parse(self) -> list[any]:
+    def parse(self) -> dict[str, any]:  # type: ignore
         arguments = self.__parse_system_args()
 
         if "help" in arguments or len(arguments) <= 0:
@@ -85,15 +90,16 @@ class InputArgumentParser:
     # endregion
 
     # region private
-    def __validate_and_return_arguments(self, arguments: dict[str, str]) -> dict[str, any]:
-        return_dict = dict[str, any]()
+    # type: ignore
+    def __validate_and_return_arguments(self, arguments: dict[str, str]) -> dict[str, any]:  # type: ignore
+        return_dict = dict[str, any]()  # type: ignore
 
         arguments_settings = self.__arguments
 
         for key in arguments_settings:
             argument_setting = self.__arguments[key]
-            
-            if argument_setting.required and (argument_setting.argument_name in arguments) == False:
+
+            if argument_setting.required and not argument_setting.argument_name in arguments:
                 raise InputArgumentNotExists(argument_setting.argument_name)
 
             if argument_setting.argument_name in arguments:
@@ -101,12 +107,14 @@ class InputArgumentParser:
                     raise InputArgumentInvalid(
                         argument_setting.argument_name)
 
-                for custom_validation in argument_setting.validating_functions:
-                    custom_validation_output = custom_validation()
+                if argument_setting.validating_functions is not None and len(argument_setting.validating_functions) > 0:
+                    for custom_validation in argument_setting.validating_functions:
+                        custom_validation_output = custom_validation(
+                            arguments[argument_setting.argument_name], argument_setting)
 
-                    if custom_validation_output:
-                        raise InputArgumentInvalid(
-                            argument_setting.argument_name)
+                        if not custom_validation_output:
+                            raise InputArgumentInvalid(
+                                argument_setting.argument_name)
 
                 try:
                     return_dict[argument_setting.argument_name] = type(
@@ -116,7 +124,7 @@ class InputArgumentParser:
                         argument_setting.argument_name)
 
             else:
-                return_dict[argument_setting.argument_name] = ""
+                return_dict[argument_setting.argument_name] = argument_setting.value if argument_setting.value else ""
 
         return return_dict
 
@@ -136,7 +144,7 @@ class InputArgumentParser:
                 "-", "")
             if not item in arguments:
                 arguments[key] = ""
-
+                
         return arguments
 
     def __show_help(self):
@@ -147,7 +155,7 @@ class InputArgumentParser:
         for key in self.__arguments:
             item = self.__arguments[key]
             argument_helper_text += \
-                f">> --{key} : type ({type(item.value).__name__}) :  :{' [Optional] ' if not item.required else ' '} {item.description if item.description else 'No description provided'} \n" \
+                f">> --{key} : type ({type(item.value).__name__}) :  :{' [Optional] ' if not item.required else ' '}{('[Default]: `' + str(item.value) + '` | ') if item.value else ' '} {item.description if item.description else 'No description provided'} \n" \
                 + f">> > -{key} \n"
 
         # print help
