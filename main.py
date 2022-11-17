@@ -5,15 +5,13 @@ Example python3 main.py --probes=input_data/Probes.csv --sampleannot=input_data/
 """
 # TODO: add check for cutof in generating data microarray
 # TODO: argument validation fields
-import os
-import queue
-import random
-import threading
+import json
+import multiprocessing
 from csv import DictReader, Sniffer
-from itertools import combinations, groupby
+from itertools import combinations, groupby, islice
 from os import path
 from statistics import mean
-from time import sleep
+import time
 from typing import Any
 
 from library.InputArgumentParser import ArgumentInfo, InputArgumentParser
@@ -67,6 +65,15 @@ def get_arguments() -> dict[str, Any]:  # type: ignore
 
 # endregion
 
+# region util
+
+
+def chunk(data, size=10000):
+    it = iter(data)
+    for i in range(0, len(data), size):
+        yield {k: data[k] for k in islice(it, size)}
+# region
+
 # region Classes
 
 
@@ -88,8 +95,7 @@ class CSVFileClass:
 class MicroExpressionClass:
     def __init__(self, line: list[str]) -> None:
         self.__probe_id = int(line[0])
-        del line[0]
-        self.__expressions = [float(x) for x in line]
+        self.__expressions = [float(x) for x in line[1::]]
 
     def get_probe_id(self) -> int:
         return self.__probe_id
@@ -114,6 +120,10 @@ class DiffStructure:
 
     def __init__(self, region_one_key: str, region_one_data: set[int], region_two_key: str, region_two_data: set[int]) -> None:
         self.shared_region_data = region_one_data.intersection(region_two_data)
+
+        print(json.dumps(list(region_two_data)))
+
+        print(json.dumps(list(region_one_data)))
 
         self.diff_name = region_one_key + " - " + region_two_key
 
@@ -150,8 +160,17 @@ def read_csv_file(file_path: str, has_header: bool) -> CSVFileClass | None:
 
 # region Microarray Expression
 
+def sort_and_filter_microarray_expression(delimiter, grouped_micro_expressions: dict[str, list[str]]) -> dict[int, MicroExpressionClass]:
+    return_micro_expression = dict[int, MicroExpressionClass]()
+
+    for key, grouped in grouped_micro_expressions.items():
+        return_micro_expression[int(key)] = list(
+            sorted([MicroExpressionClass(item.split(delimiter)) for item in grouped], key=lambda x: x.get_average(), reverse=True))[0]
+
+    return return_micro_expression
+
+
 def read_microarray_expression(file_path: str) -> dict[int, MicroExpressionClass]:
-    micro_expressions = list[MicroExpressionClass]()
     return_micro_expression = dict[int, MicroExpressionClass]()
 
     with open(file_path, "r", encoding="UTF-8") as file_data:
@@ -159,29 +178,48 @@ def read_microarray_expression(file_path: str) -> dict[int, MicroExpressionClass
 
         file_data.seek(0)
 
-        micro_expressions = [MicroExpressionClass(item.split(delimiter)) for item
-                             in file_data]
+        grouped_micro_expressions = {key: list(items) for key, items in groupby(
+            file_data, lambda x: x.split(delimiter, maxsplit=1)[0])}
 
-        grouped_micro_expressions = groupby(
-            micro_expressions, lambda x: x.get_probe_id())
+        pool = multiprocessing.Pool()
 
-        for key, grouped in grouped_micro_expressions:
-            return_micro_expression[key] = list(
-                sorted(grouped, key=lambda x: x.get_average(), reverse=True))[0]
+        chucked_data = [(delimiter, item) for item in chunk(grouped_micro_expressions, len(
+            grouped_micro_expressions) // multiprocessing.cpu_count())]
+
+        outputs = pool.starmap(
+            sort_and_filter_microarray_expression, chucked_data)
+
+        for item in outputs:
+            return_micro_expression.update(item)
 
     return return_micro_expression
+
+
+def filter_microarray_expression_by_cutoff(key: str, check_index: int, cutoff: int, micro_expressions: dict[int, MicroExpressionClass]) -> tuple[str, list[int]]:
+    return (key, [probe_id for probe_id, val in micro_expressions.items() if val.get_expression(check_index) >= float(cutoff)])
 
 
 def process_microarray_with_sample_annot(micro_expressions: dict[int, MicroExpressionClass], cutoff: int, sample_annots: dict[str, dict[int, dict[str, Any]]]) -> dict[str, list[int]]:
     return_dict = dict[str, list[int]]()
 
-    for structure_acronym, sample_annot in sample_annots.items():
-        probe_ids = list[int]()
-        for item in sample_annot:
-            probe_ids += [probe_id
-                          for probe_id, val in micro_expressions.items() if val.get_expression(item) >= float(cutoff)]
+    process_data = list[tuple[str, int, int,
+                              dict[int, MicroExpressionClass]]]()
 
-        return_dict[structure_acronym] = probe_ids
+    for structure_acronym, sample_annot in sample_annots.items():
+        for item in sample_annot:
+            process_data.append(
+                (structure_acronym, item, cutoff, micro_expressions))
+
+    pool = multiprocessing.Pool()
+
+    outputs = pool.starmap(
+        filter_microarray_expression_by_cutoff, process_data)
+
+    for item in outputs:
+        if item[0] in return_dict:
+            return_dict[item[0]] += item[1]
+        else:
+            return_dict[item[0]] = item[1]
 
     return return_dict
     # endregion
@@ -199,10 +237,10 @@ def read_sample_annot(file_path: str, regions: list[str]) -> dict[str, dict[int,
     }
 
     if file_data is not None:
-
         for index, row in enumerate(file_data.get_data()):
             # why + 2
             if str(row["structure_acronym"]).upper() in return_regions:
+                print(index + 1)
                 return_regions[str(row["structure_acronym"]
                                    ).upper()][index + 1] = row
 
@@ -243,7 +281,8 @@ Regions: {v.diff_name}
             tmp_str += "\n"
 
         tmp_str += f"{len(v.shared_region_data)} shared genes: " + \
-            str([probes[item][field_name] for item in v.shared_region_data])
+            str([str(probes[item][field_name] + " : " + str(item))
+                for item in v.shared_region_data])
 
         return_list.append(tmp_str)
 
@@ -265,54 +304,10 @@ def get_diffrence_between_structure_probes(structures_with_probes: dict[str, lis
 
 # endregion
 
-# region Test
-
-# region Queue
-
-my_queue = queue.Queue()
-
-
-def storeInQueue(f):
-    def wrapper(*args):
-        my_queue.put(f(*args))
-    return wrapper
-
-# endregion
-
-
-@storeInQueue
-def task1(test: str):
-    print("Task {} assigned to thread: {}".format(
-        test, threading.current_thread().name))
-    speel_time = random.randint(100, 500)
-    print(speel_time)
-
-    sleep(speel_time)
-    print("ID of process running task {}: {}".format(test, os.getpid()))
-
-    return f"{test} with max sleep of {speel_time}"
-
-
-def start_multi_theating():
-    # creating threads
-    t1 = threading.Thread(target=task1, name='t1', args=("test 1",))
-    t2 = threading.Thread(target=task1, name='t2', args=("test 2",))
-
-    # starting threads
-    t1.start()
-    t2.start()
-
-    # wait until all threads finish
-    t1.join()
-    t2.join()
-
-    my_data = my_queue.get()
-    print(my_data)
-
-# endregion
-
 
 def main():
+    start = time.time()
+    
     # get the arguments
     arguments = get_arguments()
 
@@ -332,8 +327,6 @@ def main():
     sample_annot = read_sample_annot(
         sample_annot_file_path, regions)
 
-    # print(json.dumps(sample_annot))
-
     structures_with_probe_ids = process_microarray_with_sample_annot(
         microarray_expressions, cutoff, sample_annot)
 
@@ -348,7 +341,15 @@ def main():
 
     for i in data_strings:
         print(i)
+        
+    end = time.time()
+ 
+    # print the difference between start
+    # and end time in milli. secs
+    print("The time of execution of above program is :",
+      (end-start) * 10**3, "ms")
 
 
 if __name__ == "__main__":
+
     main()
